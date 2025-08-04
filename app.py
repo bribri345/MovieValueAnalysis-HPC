@@ -53,7 +53,6 @@ def load_model():
     Loads the Mistral model from a local path.
     """
     # Define the local path to the downloaded model
-    # THIS PATH IS NOW CORRECTED TO THE MISTRAL MODEL
     model_id = "/home/tcwong383/movie_value_analysis/Mistral-7B-Instruct-v0.2"
 
     try:
@@ -66,10 +65,9 @@ def load_model():
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.bfloat16, # Corrected from bfloat116 for common use.
-            device_map="auto", # Automatically distributes model across available GPUs
-            load_in_4bit=True # Recommended for 70B models if GPU memory is limited
-            # Removed: token=hf_token
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            load_in_4bit=True
         )
         model.eval() # Set model to evaluation mode
 
@@ -238,4 +236,98 @@ def get_batch_movie_ratings(movie_titles: list) -> list:
                 clean_movie_data = {"Movie Title": movie_title}
                 for value_name in VALUE_HEADERS:
                     rating = movie_data.get(value_name)
-                    if isinstance(
+                    if isinstance(rating, (int, float)):
+                        rating = int(rating)
+                        if -5 <= rating <= 5:
+                            clean_movie_data[value_name] = rating
+                        else:
+                            clean_movie_data[value_name] = None
+                            logger.warning(f"Warning: Rating for '{movie_title}' - '{value_name}' ({rating}) out of -5 to +5 range. Setting to None.")
+                    else:
+                        clean_movie_data[value_name] = None
+                        logger.warning(f"Warning: Rating for '{movie_title}' - '{value_name}' missing or not an integer. Setting to None.")
+                processed_ratings.append(clean_movie_data)
+
+            if not processed_ratings:
+                raise ValueError("No valid movie ratings found after processing JSON response.")
+            return processed_ratings
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Attempt {attempt + 1} failed (JSON parsing error): {e} - Raw text start:\n{generated_text[:500]}...", exc_info=True)
+            time.sleep(10)
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed due to an unexpected error: {e}", exc_info=True)
+            time.sleep(10)
+    logger.error("All attempts to get movie ratings failed. Returning empty results.")
+    return None
+
+def process_movie_list(csv_file, progress=gr.Progress()):
+    """
+    Processes a list of movies from a CSV in a single batch and returns a DataFrame.
+    """
+    if csv_file is None:
+        raise gr.Error("Please upload a movie list CSV file.")
+    try:
+        df = pd.read_csv(csv_file.name)
+        if 'Movie Title' not in df.columns:
+            raise gr.Error("CSV must contain a 'Movie Title' column.")
+    except Exception as e:
+        logger.error(f"Failed to read CSV file: {e}", exc_info=True)
+        raise gr.Error(f"Failed to read CSV file: {e}")
+
+    movie_titles = [str(title).strip() for title in df['Movie Title'] if pd.notna(title) and str(title).strip()]
+    if not movie_titles:
+        raise gr.Error("No valid movie titles found in the CSV. Please check the 'Movie Title' column.")
+
+    progress(0.5, desc=f"Analyzing {len(movie_titles)} movies in one batch. This may take a moment, depending on model and movie count...")
+
+    results = get_batch_movie_ratings(movie_titles)
+
+    if results:
+        output_df = pd.DataFrame(results)
+        final_columns = ['Movie Title'] + VALUE_HEADERS
+
+        output_df = output_df.reindex(columns=final_columns)
+
+        progress(1.0, desc="Analysis complete!")
+        return output_df
+    else:
+        gr.Warning("The model failed to return ratings for any movies. This could be due to model errors, invalid output, or resource limitations. Please check the movie titles or try again, or consult the logs for more details.")
+        return pd.DataFrame(columns=['Movie Title'] + VALUE_HEADERS)
+
+# --- Gradio Interface Definition ---
+with gr.Blocks(theme=gr.themes.Soft(), title="Movie Value Analysis") as demo:
+    gr.Markdown("# 🎬 Movie Value Analysis (Batch Mode)")
+    gr.Markdown("""
+    Upload a CSV with a 'Movie Title' column to analyze movies based on Schwartz's 19 basic human values
+    using the Llama-3.1-Centaur-70B model. **Note: This model requires significant GPU resources and
+    your Hugging Face API token (`HF_TOKEN`) set as an environment variable for access to gated models.**
+    """)
+    with gr.Row():
+        movie_csv_input = gr.File(label="Upload Movie List CSV", file_types=[".csv"])
+    
+    if generator is None:
+        gr.Markdown(
+            """
+            <p style="color: red; font-weight: bold;">
+            Warning: Model failed to load at startup. Analysis functionality will not work.
+            Please check your environment variables (HF_TOKEN) and GPU resources.
+            Consult the application logs for detailed error messages.
+            </p>
+            """,
+            label="Model Load Warning"
+        )
+    
+    analyze_button = gr.Button("Analyze Movies in One Batch", variant="primary", interactive=(generator is not None))
+    gr.Markdown("## 📊 Analysis Results")
+    output_dataframe = gr.DataFrame(label="Movie Ratings", wrap=True)
+
+    analyze_button.click(
+        fn=process_movie_list,
+        inputs=[movie_csv_input],
+        outputs=[output_dataframe],
+        api_name="analyze_movies"
+    )
+
+if __name__ == "__main__":
+    demo.launch()
